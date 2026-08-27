@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PREFIX_TABLE="prefix"
+readonly KEY_ORDER="q w e r t y u i o p a s d f g h j k l z x c v b n m"
+
+TMP_DIR=""
+BINDINGS_FILE=""
+STATE_DIR=""
+DRY_RUN=0
+CONFLICT_POLICY="skip"
+LAYOUT="dubeolsik"
+ADDED=0
+UPDATED=0
+REMOVED=0
+SKIPPED=0
+CONFLICTS=0
+
+PARSED_REPEAT=0
+PARSED_KEY=""
+PARSED_COMMAND=""
+FOUND_EXISTS=0
+FOUND_LINE=""
+FOUND_REPEAT=0
+FOUND_COMMAND=""
+STATE_EXISTS=0
+STATE_TARGET=""
+STATE_REPEAT=0
+STATE_COMMAND=""
+
+cleanup() {
+  if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+    rm -rf "$TMP_DIR"
+  fi
+}
+trap cleanup EXIT
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  tmux-hangul sync [--dry-run]
+  tmux-hangul clear
+  tmux-hangul --dry-run
+USAGE
+}
+
+tmux_option() {
+  local option="$1"
+  tmux show-option -gqv "$option" 2>/dev/null || true
+}
+
+expand_path() {
+  local path="$1"
+  if [[ "$path" == "~/"* ]]; then
+    path="$HOME/${path#~/}"
+  fi
+  printf '%s' "$path"
+}
+
+configure() {
+  local configured_state_dir
+  local configured_layout
+  configured_state_dir="${TMUX_HANGUL_STATE_DIR:-$(tmux_option @hangul_prefix_state_dir)}"
+  if [[ -z "$configured_state_dir" ]]; then
+    configured_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-hangul"
+  fi
+  STATE_DIR="$(expand_path "$configured_state_dir")"
+
+  configured_layout="$(tmux_option @hangul_prefix_layout)"
+  [[ -n "$configured_layout" ]] || configured_layout="dubeolsik"
+  case "$configured_layout" in
+    dubeolsik) LAYOUT="$configured_layout" ;;
+    *)
+      printf 'tmux-hangul: unsupported keyboard layout %s\n' "$configured_layout" >&2
+      return 1
+      ;;
+  esac
+
+  CONFLICT_POLICY="$(tmux_option @hangul_prefix_conflict)"
+  [[ -n "$CONFLICT_POLICY" ]] || CONFLICT_POLICY="skip"
+  case "$CONFLICT_POLICY" in
+    skip|overwrite|error) ;;
+    *)
+      printf 'tmux-hangul: unknown conflict policy %s; using skip\n' "$CONFLICT_POLICY" >&2
+      CONFLICT_POLICY="skip"
+      ;;
+  esac
+}
+
+dubeolsik_for_key() {
+  [[ "$LAYOUT" == "dubeolsik" ]] || return 1
+  case "$1" in
+    q) printf 'ㅂ' ;;
+    w) printf 'ㅈ' ;;
+    e) printf 'ㄷ' ;;
+    r) printf 'ㄱ' ;;
+    t) printf 'ㅅ' ;;
+    y) printf 'ㅛ' ;;
+    u) printf 'ㅕ' ;;
+    i) printf 'ㅑ' ;;
+    o) printf 'ㅐ' ;;
+    p) printf 'ㅔ' ;;
+    a) printf 'ㅁ' ;;
+    s) printf 'ㄴ' ;;
+    d) printf 'ㅇ' ;;
+    f) printf 'ㄹ' ;;
+    g) printf 'ㅎ' ;;
+    h) printf 'ㅗ' ;;
+    j) printf 'ㅓ' ;;
+    k) printf 'ㅏ' ;;
+    l) printf 'ㅣ' ;;
+    z) printf 'ㅋ' ;;
+    x) printf 'ㅌ' ;;
+    c) printf 'ㅊ' ;;
+    v) printf 'ㅍ' ;;
+    b) printf 'ㅠ' ;;
+    n) printf 'ㅜ' ;;
+    m) printf 'ㅡ' ;;
+    *) return 1 ;;
+  esac
+}
+
+parse_binding_line() {
+  local line="$1"
+  PARSED_REPEAT=0
+  PARSED_KEY=""
+  PARSED_COMMAND=""
+
+  if [[ "$line" =~ ^bind-key[[:space:]]+(-r[[:space:]]+)?-T[[:space:]]+prefix[[:space:]]+([^[:space:]]+)[[:space:]]*(.*)$ ]]; then
+    if [[ -n "${BASH_REMATCH[1]}" ]]; then
+      PARSED_REPEAT=1
+    fi
+    PARSED_KEY="${BASH_REMATCH[2]}"
+    PARSED_COMMAND="${BASH_REMATCH[3]}"
+    return 0
+  fi
+  return 1
+}
+
+refresh_bindings() {
+  tmux list-keys -T "$PREFIX_TABLE" > "$BINDINGS_FILE"
+}
+
+find_binding() {
+  local wanted_key="$1"
+  local line
+  FOUND_EXISTS=0
+  FOUND_LINE=""
+  FOUND_REPEAT=0
+  FOUND_COMMAND=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if parse_binding_line "$line" && [[ "$PARSED_KEY" == "$wanted_key" ]]; then
+      FOUND_EXISTS=1
+      FOUND_LINE="$line"
+      FOUND_REPEAT="$PARSED_REPEAT"
+      FOUND_COMMAND="$PARSED_COMMAND"
+      return 0
+    fi
+  done < "$BINDINGS_FILE"
+}
+
+load_state() {
+  local source_key="$1"
+  local state_file="$STATE_DIR/$source_key"
+  STATE_EXISTS=0
+  STATE_TARGET=""
+  STATE_REPEAT=0
+  STATE_COMMAND=""
+
+  [[ -f "$state_file" ]] || return 0
+
+  STATE_TARGET="$(sed -n '1p' "$state_file" 2>/dev/null || true)"
+  STATE_REPEAT="$(sed -n '2p' "$state_file" 2>/dev/null || true)"
+  STATE_COMMAND="$(sed -n '3p' "$state_file" 2>/dev/null || true)"
+  if [[ -n "$STATE_TARGET" && ( "$STATE_REPEAT" == "0" || "$STATE_REPEAT" == "1" ) ]]; then
+    STATE_EXISTS=1
+  fi
+}
+
+remove_state() {
+  local source_key="$1"
+  rm -f "$STATE_DIR/$source_key"
+}
+
+write_state() {
+  local source_key="$1"
+  local target_key="$2"
+  local repeat="$3"
+  local command="$4"
+  local state_file="$STATE_DIR/$source_key"
+  local temp_state
+
+  mkdir -p "$STATE_DIR"
+  temp_state="$(mktemp "$STATE_DIR/.${source_key}.tmp.XXXXXX")"
+  {
+    printf '%s\n' "$target_key"
+    printf '%s\n' "$repeat"
+    printf '%s\n' "$command"
+  } > "$temp_state"
+  mv -f "$temp_state" "$state_file"
+}
+
+binding_fingerprint() {
+  printf '%s\t%s' "$1" "$2"
+}
+
+make_bind_line() {
+  local target_key="$1"
+  local repeat="$2"
+  local command="$3"
+  if [[ "$repeat" == "1" ]]; then
+    printf 'bind-key -r -T %s %s' "$PREFIX_TABLE" "$target_key"
+  else
+    printf 'bind-key -T %s %s' "$PREFIX_TABLE" "$target_key"
+  fi
+  if [[ -n "$command" ]]; then
+    printf ' %s' "$command"
+  fi
+  printf '\n'
+}
+
+apply_bind_line() {
+  local line="$1"
+  local source_file="$TMP_DIR/apply.tmux"
+  printf '%s' "$line" > "$source_file"
+  tmux source-file "$source_file"
+}
+
+apply_unbind() {
+  local target_key="$1"
+  tmux unbind-key -q -T "$PREFIX_TABLE" "$target_key"
+}
+
+print_dry_action() {
+  printf '%s\n' "$*"
+}
+
+conflict() {
+  local source_key="$1"
+  local target_key="$2"
+  local reason="$3"
+  SKIPPED=$((SKIPPED + 1))
+  CONFLICTS=$((CONFLICTS + 1))
+  if [[ "$DRY_RUN" == "1" ]]; then
+    print_dry_action "! skip $source_key -> $target_key: $reason"
+  else
+    printf 'tmux-hangul: skip %s -> %s: %s\n' "$source_key" "$target_key" "$reason" >&2
+  fi
+}
+
+sync_source() {
+  local source_key="$1"
+  local target_key="$2"
+  local source_exists=0
+  local source_repeat=0
+  local source_command=""
+  local desired_line=""
+  local desired_fingerprint=""
+  local target_exists=0
+  local target_repeat=0
+  local target_command=""
+  local target_fingerprint=""
+  local old_owned=0
+  local old_target=""
+  local old_fingerprint=""
+  local old_target_exists=0
+
+  find_binding "$source_key"
+  if [[ "$FOUND_EXISTS" == "1" ]]; then
+    source_exists=1
+    source_repeat="$FOUND_REPEAT"
+    source_command="$FOUND_COMMAND"
+  fi
+
+  load_state "$source_key"
+  if [[ "$STATE_EXISTS" == "1" ]]; then
+    old_target="$STATE_TARGET"
+    find_binding "$old_target"
+    if [[ "$FOUND_EXISTS" == "1" ]]; then
+      old_target_exists=1
+      old_fingerprint="$(binding_fingerprint "$FOUND_REPEAT" "$FOUND_COMMAND")"
+      if [[ "$old_fingerprint" == "$(binding_fingerprint "$STATE_REPEAT" "$STATE_COMMAND")" ]]; then
+        old_owned=1
+      fi
+    fi
+
+    if [[ "$old_owned" != "1" ]]; then
+      if [[ "$DRY_RUN" == "1" ]]; then
+        if [[ "$old_target_exists" == "1" ]]; then
+          print_dry_action "! release state for $source_key: target $old_target is no longer plugin-owned"
+        fi
+      else
+        remove_state "$source_key"
+      fi
+    fi
+  fi
+
+  if [[ "$source_exists" != "1" ]]; then
+    if [[ "$old_owned" == "1" ]]; then
+      if [[ "$DRY_RUN" == "1" ]]; then
+        print_dry_action "- unbind -T $PREFIX_TABLE $old_target"
+      else
+        apply_unbind "$old_target"
+        refresh_bindings
+        remove_state "$source_key"
+      fi
+      REMOVED=$((REMOVED + 1))
+    fi
+    return 0
+  fi
+
+  desired_line="$(make_bind_line "$target_key" "$source_repeat" "$source_command")"
+  desired_fingerprint="$(binding_fingerprint "$source_repeat" "$source_command")"
+
+  find_binding "$target_key"
+  if [[ "$FOUND_EXISTS" == "1" ]]; then
+    target_exists=1
+    target_repeat="$FOUND_REPEAT"
+    target_command="$FOUND_COMMAND"
+    target_fingerprint="$(binding_fingerprint "$target_repeat" "$target_command")"
+  fi
+
+  if [[ "$target_exists" == "1" && "$target_fingerprint" == "$desired_fingerprint" ]]; then
+    if [[ "$old_owned" == "1" && "$old_target" != "$target_key" ]]; then
+      if [[ "$DRY_RUN" == "1" ]]; then
+        print_dry_action "- unbind -T $PREFIX_TABLE $old_target"
+      else
+        apply_unbind "$old_target"
+        refresh_bindings
+      fi
+      REMOVED=$((REMOVED + 1))
+    fi
+
+    if [[ "$old_owned" == "1" && "$old_target" == "$target_key" ]]; then
+      if [[ "$DRY_RUN" != "1" ]]; then
+        write_state "$source_key" "$target_key" "$source_repeat" "$source_command"
+      fi
+    fi
+    return 0
+  fi
+
+  if [[ "$target_exists" == "1" && "$old_owned" != "1" ]]; then
+    if [[ "$CONFLICT_POLICY" != "overwrite" ]]; then
+      conflict "$source_key" "$target_key" "existing binding"
+      return 0
+    fi
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    if [[ "$target_exists" == "1" ]]; then
+      print_dry_action "~ update $source_key -> $target_key: $desired_line"
+      UPDATED=$((UPDATED + 1))
+    else
+      print_dry_action "+ add $source_key -> $target_key: $desired_line"
+      ADDED=$((ADDED + 1))
+    fi
+    if [[ "$old_owned" == "1" && "$old_target" != "$target_key" ]]; then
+      print_dry_action "- unbind -T $PREFIX_TABLE $old_target"
+      REMOVED=$((REMOVED + 1))
+    fi
+    return 0
+  fi
+
+  apply_bind_line "$desired_line"
+  refresh_bindings
+  write_state "$source_key" "$target_key" "$source_repeat" "$source_command"
+
+  if [[ "$target_exists" == "1" ]]; then
+    UPDATED=$((UPDATED + 1))
+  else
+    ADDED=$((ADDED + 1))
+  fi
+
+  if [[ "$old_owned" == "1" && "$old_target" != "$target_key" ]]; then
+    apply_unbind "$old_target"
+    refresh_bindings
+    REMOVED=$((REMOVED + 1))
+  fi
+}
+
+sync_bindings() {
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tmux-hangul.XXXXXX")"
+  BINDINGS_FILE="$TMP_DIR/bindings"
+  refresh_bindings
+  if [[ "$DRY_RUN" != "1" ]]; then
+    mkdir -p "$STATE_DIR"
+  fi
+
+  local source_key
+  for source_key in $KEY_ORDER; do
+    target_key="$(dubeolsik_for_key "$source_key")"
+    sync_source "$source_key" "$target_key"
+  done
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf 'tmux-hangul: dry-run added=%d updated=%d removed=%d skipped=%d\n' "$ADDED" "$UPDATED" "$REMOVED" "$SKIPPED"
+  else
+    printf 'tmux-hangul: added=%d updated=%d removed=%d skipped=%d\n' "$ADDED" "$UPDATED" "$REMOVED" "$SKIPPED"
+  fi
+
+  if [[ "$CONFLICT_POLICY" == "error" && "$CONFLICTS" -gt 0 ]]; then
+    return 1
+  fi
+}
+
+clear_bindings() {
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tmux-hangul.XXXXXX")"
+  BINDINGS_FILE="$TMP_DIR/bindings"
+  refresh_bindings
+
+  local source_key
+  for source_key in $KEY_ORDER; do
+    load_state "$source_key"
+    [[ "$STATE_EXISTS" == "1" ]] || continue
+    target_key="$STATE_TARGET"
+    find_binding "$target_key"
+    if [[ "$FOUND_EXISTS" == "1" && "$(binding_fingerprint "$FOUND_REPEAT" "$FOUND_COMMAND")" == "$(binding_fingerprint "$STATE_REPEAT" "$STATE_COMMAND")" ]]; then
+      apply_unbind "$target_key"
+      REMOVED=$((REMOVED + 1))
+      refresh_bindings
+    else
+      SKIPPED=$((SKIPPED + 1))
+      printf 'tmux-hangul: preserve %s; binding changed or is absent\n' "$target_key" >&2
+    fi
+    remove_state "$source_key"
+  done
+
+  printf 'tmux-hangul: cleared=%d skipped=%d\n' "$REMOVED" "$SKIPPED"
+}
+
+main() {
+  local command="${1:-sync}"
+  shift || true
+
+  configure
+  case "$command" in
+    sync)
+      if [[ "${1:-}" == "--dry-run" ]]; then
+        DRY_RUN=1
+        shift
+      fi
+      [[ "$#" -eq 0 ]] || { usage >&2; return 2; }
+      sync_bindings
+      ;;
+    --dry-run|dry-run)
+      [[ "$#" -eq 0 ]] || { usage >&2; return 2; }
+      DRY_RUN=1
+      sync_bindings
+      ;;
+    clear)
+      [[ "$#" -eq 0 ]] || { usage >&2; return 2; }
+      clear_bindings
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      usage >&2
+      return 2
+      ;;
+  esac
+}
+
+main "$@"
